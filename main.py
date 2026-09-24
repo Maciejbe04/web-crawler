@@ -1,4 +1,4 @@
-import requests,re, urllib.parse as urp, threading
+import requests,re, urllib.parse as urp, threading, time
 from concurrent.futures import ThreadPoolExecutor
 
 class Spider:
@@ -35,13 +35,12 @@ class Spider:
         response_url = self.parse_url(url)
 
         if response_url in Spider.visited:
-            return 0
+            return 0    
         
         try:
             content = requests.get(self.url.strip()).text
             Spider.visited.add(self.url)
             response_url = self.url
-            Spider.depth_dict[response_url] = 0
 
         except requests.exceptions.ConnectionError as ex:
             print("couldnt connect")
@@ -54,42 +53,29 @@ class Spider:
 
         all_links = self.filter_scope(list_of_static_links) + list_of_referals
 
-        threads = []
+        with ThreadPoolExecutor(max_workers=self.threads) as ex:
+            for link in all_links:
 
-        for link in all_links:
+                normalized_path = self.normalize_path(response_url, link)
 
-            normalized_path = self.normalize_path(response_url, link)
-
-            thread_depth = 0
-            
-            if "https://" in link and "http://" in link:
-                normalized_path = link
-            
-            if normalized_path not in Spider.visited:
                 thread_depth = 0
-            else:
-                continue
+                
+                if "https://" in link and "http://" in link:
+                    normalized_path = link
+                
+                if normalized_path not in Spider.visited:
+                    thread_depth = 0
+                else:
+                    continue
 
-            t = threading.Thread(target=self.crawl, args=(normalized_path,thread_depth))
-
-
+                ex.submit(self.crawl, normalized_path, 0, ex)
             
-        print(all_links)
-        for t in threads:
-            t.start()
+  
 
-        for t in threads:
-            t.join()
-            
-    def create_thread_pool(self):
-
-        pass
-        
-
-    def crawl(self,url, depth):
+    def crawl(self,url, depth,executor):
 
         if depth > self.depth:
-            return 0
+            return 
 
         content = ""
 
@@ -97,7 +83,8 @@ class Spider:
 
         with self.lock:
             if response_url in Spider.visited:
-                return 0
+                return 
+            Spider.visited.add(response_url)
         
         try:
             response = requests.get(response_url, timeout=5)
@@ -109,14 +96,10 @@ class Spider:
             if response.status_code not in Spider.valid_codes:
                 return 0
 
-            Spider.depth_dict[response_url] = 0
-
         except requests.exceptions.ConnectionError as ex:
             print("Couldnt connect to adress")
             return 0
 
-        with self.lock:
-            Spider.visited.add(response_url)
 
         list_of_static_links = re.findall(Spider.static_page_pattern, content)
         list_of_referals = re.findall(Spider.referer_pattern, content)
@@ -127,15 +110,17 @@ class Spider:
 
             normalized_path = self.normalize_path(response_url, link)
 
-            if "https://" in link and "http://" in link:
+            if "https://" in link or "http://" in link:
                 normalized_path = link
 
             if normalized_path not in Spider.visited:
-                self.crawl(normalized_path, depth+1)
+                executor.submit(self.crawl, normalized_path, depth+1, executor)
             else:
                 continue
 
     def initialize(self):
+
+        print(f"[*] Crawling... {self.url}")
 
         self.init_crawl(self.url)
 
@@ -147,7 +132,11 @@ class Spider:
         print("=======================================")
 
         for link in self.visited:
-            print(link + "\n")
+            print(link)
+        print("=======================================")
+        print(f"[+] Found {len(self.visited)} links")
+        print("=======================================")
+
 
     def validate_fields(self):
 
@@ -183,8 +172,16 @@ class Spider:
 
         return normalized
 
-    
-if __name__ == "__main__":
-    spider = Spider(url="https://books.toscrape.com/", depth=2, threads=10)
+
+def main():
+    spider = Spider(url="https://books.toscrape.com/", depth=1, threads=15)
+
+    start_time = time.time()
     spider.initialize()
     spider.format_results()
+
+    print(f"Execution finished in {time.time() - start_time} seconds")
+    
+if __name__ == "__main__":
+
+    main()
