@@ -1,9 +1,13 @@
 import requests,re, urllib.parse as urp, threading, time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
+import sys, getopt,os
+from rich import print
+import signal
+
 
 class Spider:
 
-    valid_codes = [200,201,301,302,405]
+    valid_codes = [200,201,204,301,302,405,500]
 
     blacklist = ['cloudflare', 'google']
 
@@ -11,7 +15,7 @@ class Spider:
 
     scope = ""
 
-    extensions = ['.js', '.html', ".php", '.css', '.ico']
+    extensions = ['.js', '.html', ".php", '.css', '.ico', "txt"]
 
     depth_dict = {}
 
@@ -27,6 +31,8 @@ class Spider:
         Spider.scope = re.search(Spider.scope_regex, self.url).group(1)
         self.lock = threading.Lock()
         self.threads = threads
+        self.tasks = []
+        Spider.executor = None
 
     def init_crawl(self, url):
 
@@ -35,7 +41,7 @@ class Spider:
         response_url = self.parse_url(url)
 
         if response_url in Spider.visited:
-            return 0    
+            return    
         
         try:
             content = requests.get(self.url.strip()).text
@@ -44,7 +50,7 @@ class Spider:
 
         except requests.exceptions.ConnectionError as ex:
             print("couldnt connect")
-            return 0
+            return 
 
         Spider.visited.add(response_url)
 
@@ -54,21 +60,30 @@ class Spider:
         all_links = self.filter_scope(list_of_static_links) + list_of_referals
 
         with ThreadPoolExecutor(max_workers=self.threads) as ex:
+
+            self.executor = ex
+
             for link in all_links:
 
                 normalized_path = self.normalize_path(response_url, link)
-
-                thread_depth = 0
                 
-                if "https://" in link and "http://" in link:
+                if "https://" in link or "http://" in link:
                     normalized_path = link
                 
-                if normalized_path not in Spider.visited:
-                    thread_depth = 0
-                else:
+                if normalized_path in Spider.visited:
                     continue
 
-                ex.submit(self.crawl, normalized_path, 0, ex)
+                future = ex.submit(self.crawl, normalized_path, 0, ex)
+                self.tasks.append(future)
+
+            while True:
+                with self.lock:
+                    pending = [f for f in self.tasks if not f.done()]
+                    if not pending:
+                        break
+                wait(pending)
+                
+                                   
             
   
 
@@ -85,6 +100,8 @@ class Spider:
             if response_url in Spider.visited:
                 return 
             Spider.visited.add(response_url)
+
+        print(depth)
         
         try:
             response = requests.get(response_url, timeout=5)
@@ -94,11 +111,11 @@ class Spider:
             response_url = response.url
                 
             if response.status_code not in Spider.valid_codes:
-                return 0
+                return 
 
         except requests.exceptions.ConnectionError as ex:
-            print("Couldnt connect to adress")
-            return 0
+            print(f"Couldnt connect to adress {response_url}")
+            return 
 
 
         list_of_static_links = re.findall(Spider.static_page_pattern, content)
@@ -114,27 +131,28 @@ class Spider:
                 normalized_path = link
 
             if normalized_path not in Spider.visited:
-                executor.submit(self.crawl, normalized_path, depth+1, executor)
+                f = executor.submit(self.crawl, normalized_path, depth+1, executor)
+                with self.lock:
+                    self.tasks.append(f)
             else:
                 continue
 
     def initialize(self):
 
-        print(f"[*] Crawling... {self.url}")
+        print(f"[*] Crawling... [bold red]{self.url}[/bold red]")
+        print(f"[*] Options THREADS = [bold green]{self.threads}[/bold green], DEPTH = [bold bright_magenta]{self.depth}[/bold bright_magenta]")
 
         self.init_crawl(self.url)
 
     def format_results(self):
 
-
-        print(f"Exec options: DEPTH: {self.depth} ")
-        print(f"[+] Found links for {self.url} website")
+        print(f"[+] Found links for [bold red]{self.url}[/bold red] website")
         print("=======================================")
 
         for link in self.visited:
-            print(link)
+            print(f"[+] [bold green]{link}[/bold green]")
         print("=======================================")
-        print(f"[+] Found {len(self.visited)} links")
+        print(f"[+] Found [bold blink medium_spring_green]{len(self.visited)} [/bold blink medium_spring_green]links")
         print("=======================================")
 
 
@@ -172,16 +190,69 @@ class Spider:
 
         return normalized
 
+def usage():
+    print("-u --url=str specify target url")
+    print("-d --depth=int specify crawling depth. Default value 1 ")
+    print("-t --threads=int specify thread count. Default value 10")
+    print("-h --help view help")
+
+
+def handle_signal(signum,frame):
+
+    if Spider.executor is not None:
+        Spider.executor.shutdown(wait=True, cancel_futures=True)
+        with open('output.txt', 'w') as file:
+            for link in Spider.visited:
+                file.write(link + "\n")
+
+    sys.exit(2)
+
 
 def main():
-    spider = Spider(url="https://books.toscrape.com/", depth=1, threads=15)
+
+
+    
+    url = ""
+    depth = 1
+    threads = 10
+    
+    if len(sys.argv) < 2:
+        usage()
+        sys.exit(2)
+    
+    opt, args = None, None
+    
+    try:
+        opt, args = getopt.getopt(sys.argv[1:], "u:d:t:h", ["url=","depth=", "threads=", "help"])
+    except getopt.error as error:
+        print(error.msg)
+        usage()
+        sys.exit(2)
+
+    for o, a in opt:
+        if o in ("-u", "--url"):
+            url = a
+        elif o in("-d", "--depth"):
+            depth = int(a)
+        elif o in ("-t", "--threads"):
+            threads = int(a)
+        elif o in ("-h", "--help"):
+            usage()
+            exit(0)
+        else:
+            usage()
+            exit(2)
+
+    spider = Spider(url=url, depth=depth, threads=threads)
 
     start_time = time.time()
+    signal.signal(signal.SIGINT, handle_signal)
     spider.initialize()
+    stop_time = time.time()
     spider.format_results()
 
-    print(f"Execution finished in {time.time() - start_time} seconds")
+    print(f"Execution finished in {stop_time - start_time} seconds")
     
 if __name__ == "__main__":
-
+    os.environ.pop("NO_COLOR", None)
     main()
