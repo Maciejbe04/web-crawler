@@ -2,7 +2,6 @@ import requests,re, urllib.parse as urp, threading, time
 from concurrent.futures import ThreadPoolExecutor, wait
 import sys, getopt,os
 from rich import print
-import signal
 import queue
 
 class Spider:
@@ -10,8 +9,6 @@ class Spider:
     valid_codes = [200,201,204,301,302,405,500]
 
     blacklist = ['cloudflare', 'google']
-
-    scope_regex = r"(?:https?:\/\/.*)\.([\w]+\.[\w]+)\/"
 
     scope = ""
 
@@ -26,12 +23,14 @@ class Spider:
         self.url = url
         self.depth = depth
         self.validate_fields()
-        Spider.scope = re.search(Spider.scope_regex, self.url).group(1)
+        Spider.scope = urp.urlparse(url).netloc
         self.lock = threading.Lock()
         self.threads = threads
-        self.queue = queue.Queue()
+        self.root_queue = queue.Queue()
+        self.children_queue = queue.Queue()
         self.depth_dict = {}
         self.current_depth = 0
+        self.session = requests.Session()
 
 
 
@@ -41,8 +40,6 @@ class Spider:
         
         response_url = self.parse_url(url)
 
-        print(f"{response_url} parsed" )
-
         with self.lock:
             if response_url in Spider.visited:
                 return [], None
@@ -50,18 +47,15 @@ class Spider:
     
         try:
             
-            response = requests.get(response_url)
+            response = self.session.get(response_url)
             response_url = response.url
             content = response.text
-
-            print(f"{response_url} response" )
 
             if response.status_code not in Spider.valid_codes:
                 Spider.visited.remove(response_url)
                 return [], None
                 
         except requests.exceptions.ConnectionError as ex:
-            print("couldnt connect")
             return [], None
 
         list_of_static_links = re.findall(Spider.static_page_pattern, content)
@@ -72,11 +66,9 @@ class Spider:
         return all_links, response_url
 
     def bfs(self, url):
-
         links, response_url = self.grab_links(url)
 
         if response_url == None:
-            self.queue.task_done()
             return 
 
         for link in links:
@@ -89,51 +81,54 @@ class Spider:
             with self.lock:
                 if normalized_path in Spider.found:
                     continue
-                self.depth_dict[normalized_path] = self.current_depth
+
+            with self.lock:
+                self.depth_dict[normalized_path] = self.depth_dict[url] + 1
                 Spider.found.add(normalized_path)
 
-            if self.current_depth == self.depth:
-                with self.lock:
+            with self.lock:
+                if self.depth_dict[url] == self.depth:
                     Spider.found.add(normalized_path)
-                continue
+                    continue
 
-            self.queue.put(normalized_path)
+            self.children_queue.put(normalized_path)
 
-        self.queue.task_done()
+    
                      
     def queue_handler(self):
 
-        self.queue.put(self.url)
+        self.root_queue.put(self.url)
         self.depth_dict[self.url] = 0
+        Spider.found.add(self.url)
 
+        futures = []
 
         with ThreadPoolExecutor(max_workers=self.threads) as exe:
 
             while True:
-                self.current_depth += 1
-                if self.current_depth > self.depth:
+                for _ in range(self.threads):
+                    future = exe.submit(self.worker)
+
+                self.root_queue.join()
+                self.root_queue = self.children_queue
+                self.children_queue = queue.Queue()
+
+                if self.root_queue.empty():
                     break
 
-                while True:
-                    futures = []
-                    for _ in range(self.threads):
-                        try:
-                            link = self.queue.get(block=False)
-                        except queue.Empty:
-                            break
+    def worker(self):
 
-                        future = exe.submit(self.bfs, link)
+        while True:
+            try:
+                root = self.root_queue.get(timeout=1)
+            except queue.Empty:
+                return 
 
-                        futures.append(future)
-                        
-                    if len(futures) == 0:
-                        return False
-
-                    if self.current_depth != self.depth:
-                        wait(futures)
+            try:
+                self.bfs(root)
+            finally:
+                self.root_queue.task_done()
             
-   
-    
 
     def initialize(self):
 
@@ -152,8 +147,6 @@ class Spider:
         print("=======================================")
         print(f"[+] Found [bold blink medium_spring_green]{len(Spider.found)} [/bold blink medium_spring_green]links")
         print("=======================================")
-        print(self.depth_dict)
-        print(len(self.depth_dict))
         print(f"Working links {len(Spider.visited)}")
 
 
@@ -191,11 +184,40 @@ class Spider:
 
         return normalized
 
+    def format_dict(self, dict) -> str:
+
+        output = """"""
+
+        for i in range(len(dict)):
+            output += f"|_______{i}\n"
+            for element in dict[i]:
+                output += f"\t{element}\n"      
+
+        return output             
+
+
+    def save_output(self,name):
+
+        output_dict = {}
+
+        for i in range(self.depth+2):
+            output_dict[i] = []
+
+        for key,val in self.depth_dict.items():
+
+            layer = self.depth_dict[key]
+            output_dict[layer].append(key)
+
+        with open(f'{name}', 'w') as file:
+            file.write(self.format_dict(output_dict))
+
+
 def usage():
     print("-u --url=str specify target url")
     print("-d --depth=int specify crawling depth. Default value 1 ")
     print("-t --threads=int specify thread count. Default value 10")
     print("-h --help view help")
+    print("-o --output dump output to file")
 
 
 def main():
@@ -205,6 +227,8 @@ def main():
     url = ""
     depth = 1
     threads = 10
+    save = 0
+    name = ""
     
     if len(sys.argv) < 2:
         usage()
@@ -213,7 +237,7 @@ def main():
     opt, args = None, None
     
     try:
-        opt, args = getopt.getopt(sys.argv[1:], "u:d:t:h", ["url=","depth=", "threads=", "help"])
+        opt, args = getopt.getopt(sys.argv[1:], "u:d:t:ho:", ["url=","depth=", "threads=", "help", "output"])
     except getopt.error as error:
         print(error.msg)
         usage()
@@ -229,6 +253,9 @@ def main():
         elif o in ("-h", "--help"):
             usage()
             exit(0)
+        elif o in ("-o", "--output"):
+            save = 1
+            name = a
         else:
             usage()
             exit(2)
@@ -241,6 +268,8 @@ def main():
     stop_time = time.time()
     spider.format_results()
 
+    if save == 1:
+        spider.save_output(name)
     print(f"Execution finished in {stop_time - start_time} seconds")
     
 if __name__ == "__main__":
